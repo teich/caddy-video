@@ -35,6 +35,46 @@ class Segment:
         return self.end - self.start
 
 
+@dataclass
+class RenderSegment:
+    start: float
+    end: float
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+class TimeMapper:
+    def __init__(self, telemetry_times: List[float], media_times: List[float]):
+        if len(telemetry_times) != len(media_times):
+            raise ValueError("time mapper arrays must have equal length")
+        if len(telemetry_times) < 2:
+            raise ValueError("time mapper needs at least two points")
+        self.telemetry_times = telemetry_times
+        self.media_times = media_times
+
+    @staticmethod
+    def _interp(x: float, xs: List[float], ys: List[float]) -> float:
+        i = bisect.bisect_right(xs, x) - 1
+        if i < 0:
+            return ys[0]
+        if i >= len(xs) - 1:
+            return ys[-1]
+        x0, x1 = xs[i], xs[i + 1]
+        y0, y1 = ys[i], ys[i + 1]
+        if x1 == x0:
+            return y0
+        a = (x - x0) / (x1 - x0)
+        return y0 + a * (y1 - y0)
+
+    def telemetry_to_media(self, t: float) -> float:
+        return self._interp(t, self.telemetry_times, self.media_times)
+
+    def media_to_telemetry(self, t: float) -> float:
+        return self._interp(t, self.media_times, self.telemetry_times)
+
+
 def run(cmd: List[str]) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -103,6 +143,23 @@ def build_buckets(decoded_csv: Path, total_secs: int):
                 b.rpm_max = max(b.rpm_max, rpm)
                 rpm_peak = max(rpm_peak, rpm)
     return buckets, rpm_peak
+
+
+def load_time_mapper(packet_summary_csv: Optional[Path]) -> Optional[TimeMapper]:
+    if packet_summary_csv is None or not packet_summary_csv.exists():
+        return None
+    telemetry_times = []
+    media_times = []
+    with packet_summary_csv.open(newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            if int(row["header_payload_len"]) <= 0:
+                continue
+            telemetry_times.append(float(row["header_timestamp_ticks"]) / 10_000_000.0)
+            media_times.append(float(row["packet_pts_time"]))
+    if len(telemetry_times) < 2:
+        return None
+    return TimeMapper(telemetry_times, media_times)
 
 
 def detect_active_start(buckets: List[Bucket]) -> int:
@@ -231,21 +288,51 @@ def cap_total_duration_by_score(segs: List[Segment], scores: List[float], max_se
     return sorted(out, key=lambda s: s.start)
 
 
-def write_plan_csv(path: Path, segs: List[Segment], scores: List[float]):
+def telemetry_to_render_segments(
+    telemetry_segs: List[Segment], mapper: Optional[TimeMapper], media_duration: float
+) -> List[RenderSegment]:
+    out = []
+    for s in telemetry_segs:
+        if mapper is None:
+            start = float(s.start)
+            end = float(s.end)
+        else:
+            start = mapper.telemetry_to_media(float(s.start))
+            end = mapper.telemetry_to_media(float(s.end))
+        start = max(0.0, min(media_duration, start))
+        end = max(start + 0.001, min(media_duration, end))
+        out.append(RenderSegment(start=start, end=end))
+    return out
+
+
+def write_plan_csv(path: Path, telemetry_segs: List[Segment], render_segs: List[RenderSegment], scores: List[float]):
     with path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["segment_index", "start_sec", "end_sec", "duration_sec", "avg_score"])
-        for i, s in enumerate(segs):
+        w.writerow(
+            [
+                "segment_index",
+                "telemetry_start_sec",
+                "telemetry_end_sec",
+                "media_start_sec",
+                "media_end_sec",
+                "duration_sec",
+                "avg_score",
+            ]
+        )
+        for i, (s, rs) in enumerate(zip(telemetry_segs, render_segs)):
             avg = sum(scores[s.start:s.end]) / max(1, s.duration)
-            w.writerow([i, s.start, s.end, s.duration, f"{avg:.4f}"])
+            w.writerow([i, s.start, s.end, f"{rs.start:.3f}", f"{rs.end:.3f}", f"{rs.duration:.3f}", f"{avg:.4f}"])
 
 
-def read_plan_csv(path: Path) -> List[Segment]:
+def read_plan_csv(path: Path) -> List[RenderSegment]:
     segs = []
     with path.open(newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            segs.append(Segment(int(row["start_sec"]), int(row["end_sec"])))
+            if "media_start_sec" in row and "media_end_sec" in row:
+                segs.append(RenderSegment(float(row["media_start_sec"]), float(row["media_end_sec"])))
+            else:
+                segs.append(RenderSegment(float(row["start_sec"]), float(row["end_sec"])))
     return segs
 
 
@@ -294,7 +381,7 @@ def make_lookup(points):
     return lookup
 
 
-def highlight_time_to_source_time(segments: List[Segment], t_highlight: float) -> float:
+def highlight_time_to_source_time(segments: List[RenderSegment], t_highlight: float) -> float:
     acc = 0.0
     for s in segments:
         seg_dur = float(s.duration)
@@ -305,11 +392,24 @@ def highlight_time_to_source_time(segments: List[Segment], t_highlight: float) -
     return float(segments[-1].end)
 
 
-def write_overlay_ass(decoded_csv: Path, segments: List[Segment], out_ass: Path, fps: float):
+def write_overlay_ass(
+    decoded_csv: Path,
+    segments: List[RenderSegment],
+    out_ass: Path,
+    fps: float,
+    mapper: Optional[TimeMapper],
+):
     if not segments:
         raise ValueError("cannot write overlay ass: no segments")
 
     series = load_overlay_series(decoded_csv)
+    if mapper is not None:
+        remapped = {}
+        for tag, points in series.items():
+            remapped_points = [(mapper.telemetry_to_media(t), v) for t, v in points]
+            remapped_points.sort(key=lambda x: x[0])
+            remapped[tag] = remapped_points
+        series = remapped
     rpm_lookup = make_lookup(series[RPM_TAG])
     lat_lookup = make_lookup(series[LAT_TAG])
     lon_lookup = make_lookup(series[LON_TAG])
@@ -356,7 +456,7 @@ def ffmpeg_escape_path(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
-def build_filter_complex(segs: List[Segment], include_audio: bool, overlay_ass: Optional[Path] = None) -> str:
+def build_filter_complex(segs: List[RenderSegment], include_audio: bool, overlay_ass: Optional[Path] = None) -> str:
     parts = []
     for i, s in enumerate(segs):
         parts.append(f"[0:v]trim=start={s.start}:end={s.end},setpts=PTS-STARTPTS[v{i}]")
@@ -377,7 +477,7 @@ def build_filter_complex(segs: List[Segment], include_audio: bool, overlay_ass: 
     return ";".join(parts)
 
 
-def render_one_pass(video: Path, segs: List[Segment], out_video: Path, overlay_ass: Optional[Path] = None):
+def render_one_pass(video: Path, segs: List[RenderSegment], out_video: Path, overlay_ass: Optional[Path] = None):
     include_audio = has_audio_stream(video)
     fc = build_filter_complex(segs, include_audio, overlay_ass=overlay_ass)
     cmd = [
@@ -435,6 +535,7 @@ def main():
     ap = argparse.ArgumentParser(description="Telemetry-driven highlight plan/render")
     ap.add_argument("--video", type=Path, required=True)
     ap.add_argument("--decoded", type=Path, required=True)
+    ap.add_argument("--packet-summary", type=Path, default=None, help="Optional packet summary CSV for telemetry/media sync")
     ap.add_argument("--out-dir", type=Path, default=Path("output"))
     ap.add_argument("--target-seconds", type=int, default=90)
     ap.add_argument("--context-seconds", type=int, default=4)
@@ -453,6 +554,12 @@ def main():
     overlay_ass = args.out_dir / f"{stem}.highlights.overlay.ass"
     out_video = args.out_dir / f"{stem}.highlights.mp4"
 
+    packet_summary = args.packet_summary
+    if packet_summary is None:
+        candidate = args.decoded.with_name(f"{stem}.packet_summary.csv")
+        if candidate.exists():
+            packet_summary = candidate
+
     segs, scores, active_start, start_floor = build_plan(
         video=args.video,
         decoded=args.decoded,
@@ -463,13 +570,23 @@ def main():
         max_total_seconds=args.max_total_seconds,
     )
 
-    write_plan_csv(plan_csv, segs, scores)
+    mapper = load_time_mapper(packet_summary)
+    media_duration = probe_duration(args.video)
+    render_segs = telemetry_to_render_segments(segs, mapper, media_duration)
+
+    write_plan_csv(plan_csv, segs, render_segs, scores)
     with_overlay = not args.no_overlay
     if with_overlay:
-        write_overlay_ass(args.decoded, segs, overlay_ass, args.overlay_fps)
+        write_overlay_ass(
+            args.decoded,
+            render_segs,
+            overlay_ass,
+            args.overlay_fps,
+            mapper,
+        )
 
     include_audio = has_audio_stream(args.video)
-    fc = build_filter_complex(segs, include_audio, overlay_ass=overlay_ass if with_overlay else None)
+    fc = build_filter_complex(render_segs, include_audio, overlay_ass=overlay_ass if with_overlay else None)
     cmd_preview = [
         "ffmpeg",
         "-y",
@@ -495,6 +612,7 @@ def main():
     print(f"start_floor_sec={start_floor}")
     print(f"segments={len(segs)}")
     print(f"total_highlight_seconds={sum(s.duration for s in segs)}")
+    print(f"time_mapper={'yes' if mapper is not None else 'no'}")
     print(f"wrote {plan_csv}")
     if with_overlay:
         print(f"wrote {overlay_ass}")

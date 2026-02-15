@@ -47,8 +47,11 @@ def process_one(
         run(extract_cmd)
 
         decoded_csv = work_dir / f"{video.stem}.decoded_updates.csv"
+        packet_summary_csv = work_dir / f"{video.stem}.packet_summary.csv"
         if not decoded_csv.exists():
             raise RuntimeError(f"decoded telemetry not found: {decoded_csv}")
+        if not packet_summary_csv.exists():
+            raise RuntimeError(f"packet summary not found: {packet_summary_csv}")
 
         highlight_cmd = [
             "python3",
@@ -57,6 +60,8 @@ def process_one(
             str(video),
             "--decoded",
             str(decoded_csv),
+            "--packet-summary",
+            str(packet_summary_csv),
             "--out-dir",
             str(work_dir),
             "--target-seconds",
