@@ -24,6 +24,7 @@ You should see a `subtitles` filter line.
 ## Repository layout
 
 - `docs/ALIVEDRIVE_FORMAT.md`: reverse-engineered AliveDrive format notes.
+- `docs/MACOS_APP_PORTING_BLUEPRINT.md`: implementation blueprint for rebuilding this pipeline as a native macOS/Xcode app.
 - `docs/telemetry_sync_findings.md`: current telemetry/audio timing investigation notes.
 - `extract_alive.py`: telemetry extractor/decoder.
 - `make_highlights.py`: plan + render highlights (current main workflow).
