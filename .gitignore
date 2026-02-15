@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Generated artifacts
+output/
+
+# Large local media inputs (keep directory structure, not raw captures)
+input/*.mp4
+input/*.mov
+input/*.m4v
