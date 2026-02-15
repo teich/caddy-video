@@ -96,6 +96,14 @@ class RenderSegment:
         return self.end - self.start
 
 
+@dataclass
+class OverlayChannel:
+    channel_id: int
+    tag: str
+    quantity_tag: str
+    points: List[Tuple[float, str]]
+
+
 class TimeMapper:
     def __init__(self, telemetry_times: List[float], media_times: List[float]):
         if len(telemetry_times) != len(media_times):
@@ -416,6 +424,76 @@ def percentile(values: Sequence[float], q: float) -> float:
     return ordered[idx]
 
 
+def ass_escape_line(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+
+def trim_channel_prefix(tag: str) -> str:
+    prefix = "com.cosworth.channel."
+    if tag.startswith(prefix):
+        return tag[len(prefix):]
+    return tag
+
+
+def format_number_for_overlay(value: str) -> str:
+    if value == "":
+        return ""
+    try:
+        num = float(value)
+    except ValueError:
+        return value
+    if num.is_integer():
+        return str(int(num))
+    abs_num = abs(num)
+    if abs_num != 0.0 and (abs_num >= 100000.0 or abs_num < 0.001):
+        return f"{num:.4e}"
+    return f"{num:.6g}"
+
+
+def row_channel_id(row: Dict[str, str]) -> int:
+    raw = row.get("channel_id", "").strip()
+    if not raw:
+        return -1
+    return int(raw)
+
+
+def load_debug_overlay_channels(decoded_csv: Path) -> List[OverlayChannel]:
+    series: Dict[str, OverlayChannel] = {}
+    with decoded_csv.open(newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            tag = row.get("channel_tag", "").strip()
+            if not tag:
+                continue
+            t = float(row["sample_time_sec"])
+            raw = format_number_for_overlay(row.get("raw_value", ""))
+            calibrated = format_number_for_overlay(row.get("calibrated_value", ""))
+            label = row.get("label", "").strip()
+
+            value = f"raw={raw} cal={calibrated}"
+            if label:
+                value += f" label={label}"
+
+            ch = series.get(tag)
+            if ch is None:
+                ch = OverlayChannel(
+                    channel_id=row_channel_id(row),
+                    tag=tag,
+                    quantity_tag=row.get("quantity_tag", "").strip(),
+                    points=[],
+                )
+                series[tag] = ch
+            ch.points.append((t, value))
+
+    if not series:
+        raise ValueError("overlay source has no channels")
+
+    channels = sorted(series.values(), key=lambda c: (c.channel_id, c.tag))
+    for ch in channels:
+        ch.points.sort(key=lambda p: p[0])
+    return channels
+
+
 def load_overlay_series(decoded_csv: Path) -> OverlaySeries:
     channel_map = {
         "rpm": RPM_TAGS,
@@ -481,6 +559,24 @@ def make_lookup(points: Sequence[Tuple[float, float]], default: float = 0.0) -> 
     vals = [v for _, v in points]
 
     def lookup(t: float) -> float:
+        idx = bisect.bisect_right(times, t) - 1
+        if idx < 0:
+            return vals[0]
+        if idx >= len(vals):
+            return vals[-1]
+        return vals[idx]
+
+    return lookup
+
+
+def make_text_lookup(points: Sequence[Tuple[float, str]], default: str = "") -> Callable[[float], str]:
+    if not points:
+        return lambda _t: default
+
+    times = [t for t, _ in points]
+    vals = [v for _, v in points]
+
+    def lookup(t: float) -> str:
         idx = bisect.bisect_right(times, t) - 1
         if idx < 0:
             return vals[0]
@@ -789,11 +885,66 @@ def write_overlay_ass(
     out_ass: Path,
     fps: float,
     mapper: Optional[TimeMapper],
+    full_debug_overlay: bool,
 ):
     if not segments:
         raise ValueError("cannot write overlay ass: no segments")
     if fps <= 0:
         raise ValueError("overlay fps must be > 0")
+
+    total_duration = sum(s.duration for s in segments)
+    frame_dt = 1.0 / fps
+
+    if full_debug_overlay:
+        channels = load_debug_overlay_channels(decoded_csv)
+        if mapper is not None:
+            for ch in channels:
+                remapped_points = [(mapper.telemetry_to_media(t), v) for t, v in ch.points]
+                remapped_points.sort(key=lambda x: x[0])
+                ch.points = remapped_points
+
+        lookups = []
+        for ch in channels:
+            lookups.append(
+                {
+                    "channel_id": ch.channel_id,
+                    "tag": trim_channel_prefix(ch.tag),
+                    "quantity": ch.quantity_tag,
+                    "lookup": make_text_lookup(ch.points),
+                }
+            )
+
+        lines = []
+        t = 0.0
+        while t < total_duration:
+            t2 = min(t + frame_dt, total_duration)
+            src_t = highlight_time_to_source_time(segments, t)
+
+            row_lines = [f"src={src_t:.3f}s highlight={t:.3f}s channels={len(lookups)}"]
+            for item in lookups:
+                unit_suffix = f" [{item['quantity']}]" if item["quantity"] else ""
+                row_lines.append(
+                    f"{item['channel_id']:03d} {item['tag']}{unit_suffix}: {item['lookup'](src_t)}"
+                )
+            text = r"\N".join(ass_escape_line(line) for line in row_lines)
+            lines.append(ass_dialogue(0, t, t2, "Telemetry", text))
+            t = t2
+
+        header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {HUD_PLAY_RES_X}
+PlayResY: {HUD_PLAY_RES_Y}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Telemetry,Menlo,15,&H00FFFFFF,&H000000FF,&H00101010,&H64000000,0,0,0,0,100,100,0,0,1,1.5,0,7,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+        out_ass.write_text(header + "\n".join(lines) + "\n")
+        return
 
     series = load_overlay_series(decoded_csv)
     if mapper is not None:
@@ -809,9 +960,6 @@ def write_overlay_ass(
     throttle_lookup = make_lookup(series["throttle"])
     brake_lookup = make_lookup(series["brake"])
     steering_lookup = make_lookup(series["steering"])
-
-    total_duration = sum(s.duration for s in segments)
-    frame_dt = 1.0 / fps
     rpm_samples = [max(0.0, v * 60.0 / (2.0 * math.pi)) for _, v in series["rpm"]]
     rpm_max_display = percentile(rpm_samples, 0.995)
     rpm_max_display = clamp(rpm_max_display, 5000.0, 12000.0)
@@ -1108,6 +1256,11 @@ def main():
     ap.add_argument("--max-total-seconds", type=int, default=120)
     ap.add_argument("--overlay-fps", type=float, default=29.97, help="Sampling rate for telemetry HUD overlay")
     ap.add_argument("--no-overlay", action="store_true", help="Disable telemetry HUD overlay")
+    ap.add_argument(
+        "--full-debug-overlay",
+        action="store_true",
+        help="Overlay all decoded telemetry fields and bypass the HUD (debug mode)",
+    )
     ap.add_argument("--run", action="store_true", help="Render output video from plan")
     args = ap.parse_args()
 
@@ -1147,6 +1300,7 @@ def main():
             overlay_ass,
             args.overlay_fps,
             mapper,
+            full_debug_overlay=args.full_debug_overlay,
         )
 
     include_audio = has_audio_stream(args.video)

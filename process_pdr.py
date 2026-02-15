@@ -24,6 +24,7 @@ def process_one(
     work_root: Optional[Path],
     target_seconds: int,
     max_total_seconds: int,
+    full_debug_overlay: bool,
 ) -> Path:
     video = video.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -70,6 +71,8 @@ def process_one(
             str(max_total_seconds),
             "--run",
         ]
+        if full_debug_overlay:
+            highlight_cmd.append("--full-debug-overlay")
         run(highlight_cmd)
 
         rendered = work_dir / f"{video.stem}.highlights.mp4"
@@ -112,6 +115,11 @@ def main() -> None:
     )
     ap.add_argument("--target-seconds", type=int, default=90)
     ap.add_argument("--max-total-seconds", type=int, default=120)
+    ap.add_argument(
+        "--full-debug-overlay",
+        action="store_true",
+        help="Overlay all decoded telemetry fields (debug mode)",
+    )
     args = ap.parse_args()
 
     failures = []
@@ -128,6 +136,7 @@ def main() -> None:
                 work_root=args.work_root,
                 target_seconds=args.target_seconds,
                 max_total_seconds=args.max_total_seconds,
+                full_debug_overlay=args.full_debug_overlay,
             )
             print(f"OK {video} -> {out_path}")
         except Exception as exc:
