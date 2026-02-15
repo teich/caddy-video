@@ -23,7 +23,8 @@ You should see a `subtitles` filter line.
 
 ## Repository layout
 
-- `ALIVEDRIVE_FORMAT.md`: reverse-engineered AliveDrive format notes.
+- `docs/ALIVEDRIVE_FORMAT.md`: reverse-engineered AliveDrive format notes.
+- `docs/telemetry_sync_findings.md`: current telemetry/audio timing investigation notes.
 - `extract_alive.py`: telemetry extractor/decoder.
 - `make_highlights.py`: plan + render highlights (current main workflow).
 - `render_text_overlay.py`: full-length overlay render helper (debug/inspection).
@@ -97,3 +98,4 @@ python3 make_highlights.py \
 - Planning uses telemetry only; there is no hard-coded time floor.
 - Generated files are intentionally git-ignored.
 - `render_text_overlay.py` is optional and mainly useful for debugging full-session overlays.
+- Timing investigation status: see `docs/telemetry_sync_findings.md`.
