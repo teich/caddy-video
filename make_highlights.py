@@ -6,14 +6,65 @@ import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 LAT_TAG = "com.cosworth.channel.accelerometer.vehicle.x"
 LON_TAG = "com.cosworth.channel.accelerometer.vehicle.y"
 THROTTLE_TAG = "com.cosworth.channel.throttle.position"
 BRAKE_TAG = "com.cosworth.channel.brake.position"
 RPM_TAG = "com.cosworth.channel.enginespeed"
+STEERING_TAG = "com.cosworth.channel.steering.angle"
+
+RPM_TAGS = (RPM_TAG, "com.cosworth.channel.rpm")
+LAT_TAGS = (LAT_TAG, "com.cosworth.channel.lateralacceleration")
+LON_TAGS = (LON_TAG,)
+THROTTLE_TAGS = (THROTTLE_TAG, "com.cosworth.channel.accelpos", "com.cosworth.channel.accelerator")
+BRAKE_TAGS = (BRAKE_TAG, "com.cosworth.channel.brakepos")
+STEERING_TAGS = (
+    STEERING_TAG,
+    "com.cosworth.channel.steeringangle",
+    "com.cosworth.channel.steerangle",
+)
+
+CHANNEL_ID_FALLBACKS = {
+    "steering": (42,),
+}
+
+TAG_ALIASES = {
+    alias: RPM_TAG for alias in RPM_TAGS
+}
+TAG_ALIASES.update({alias: LAT_TAG for alias in LAT_TAGS})
+TAG_ALIASES.update({alias: LON_TAG for alias in LON_TAGS})
+TAG_ALIASES.update({alias: THROTTLE_TAG for alias in THROTTLE_TAGS})
+TAG_ALIASES.update({alias: BRAKE_TAG for alias in BRAKE_TAGS})
+TAG_ALIASES.update({alias: STEERING_TAG for alias in STEERING_TAGS})
+
 NEEDED_TAGS = {LAT_TAG, LON_TAG, THROTTLE_TAG, BRAKE_TAG, RPM_TAG}
+
+HUD_PLAY_RES_X = 1920
+HUD_PLAY_RES_Y = 1080
+HUD_PANEL_TOP = 850
+HUD_G_CX = 220
+HUD_G_CY = 962
+HUD_G_OUTER_R = 108
+HUD_G_INNER_R = 94
+HUD_G_DOT_R = 11
+HUD_G_RANGE = 1.8
+HUD_RPM_X0 = 430
+HUD_RPM_X1 = 1490
+HUD_RPM_Y0 = 948
+HUD_RPM_Y1 = 992
+HUD_PEDAL_Y0 = 885
+HUD_PEDAL_Y1 = 1035
+HUD_THROTTLE_X0 = 1540
+HUD_THROTTLE_X1 = 1582
+HUD_BRAKE_X0 = 1600
+HUD_BRAKE_X1 = 1642
+HUD_STEER_CX = 1730
+HUD_STEER_CY = 962
+HUD_STEER_OUTER_R = 96
+HUD_STEER_INNER_R = 82
+HUD_STEER_MAX_DEG = 540.0
 
 
 @dataclass
@@ -122,7 +173,7 @@ def build_buckets(decoded_csv: Path, total_secs: int):
     with decoded_csv.open(newline="") as f:
         r = csv.DictReader(f)
         for row in r:
-            tag = row.get("channel_tag", "")
+            tag = TAG_ALIASES.get(row.get("channel_tag", ""), "")
             if tag not in NEEDED_TAGS:
                 continue
             sec = int(float(row["sample_time_sec"]))
@@ -349,26 +400,83 @@ def sec_to_ass(ts: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def load_overlay_series(decoded_csv: Path):
-    series = {RPM_TAG: [], LAT_TAG: [], LON_TAG: []}
+OverlaySeries = Dict[str, List[Tuple[float, float]]]
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    q = clamp(q, 0.0, 1.0)
+    idx = int(round((len(ordered) - 1) * q))
+    return ordered[idx]
+
+
+def load_overlay_series(decoded_csv: Path) -> OverlaySeries:
+    channel_map = {
+        "rpm": RPM_TAGS,
+        "lat": LAT_TAGS,
+        "lon": LON_TAGS,
+        "throttle": THROTTLE_TAGS,
+        "brake": BRAKE_TAGS,
+        "steering": STEERING_TAGS,
+    }
+    required = {"rpm", "lat", "lon"}
+    tags = {tag for aliases in channel_map.values() for tag in aliases}
+    by_tag: Dict[str, List[Tuple[float, float]]] = {tag: [] for tag in tags}
+    by_channel_id: Dict[int, List[Tuple[float, float]]] = {}
+
     with decoded_csv.open(newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            tag = row["channel_tag"]
-            if tag not in series:
-                continue
+            tag = row.get("channel_tag", "")
             t = float(row["sample_time_sec"])
             v = float(row["calibrated_value"])
-            series[tag].append((t, v))
+            if tag in by_tag:
+                by_tag[tag].append((t, v))
+            cid_txt = row.get("channel_id")
+            if cid_txt:
+                try:
+                    cid = int(cid_txt)
+                except ValueError:
+                    cid = None
+                if cid is not None:
+                    by_channel_id.setdefault(cid, []).append((t, v))
 
-    for tag in series:
-        series[tag].sort(key=lambda x: x[0])
-        if not series[tag]:
-            raise ValueError(f"missing required channel for overlay: {tag}")
+    for points in by_tag.values():
+        points.sort(key=lambda x: x[0])
+    for points in by_channel_id.values():
+        points.sort(key=lambda x: x[0])
+
+    series: OverlaySeries = {}
+    missing = []
+    for key, aliases in channel_map.items():
+        selected: List[Tuple[float, float]] = []
+        for alias in aliases:
+            if by_tag[alias]:
+                selected = by_tag[alias]
+                break
+        if not selected:
+            for cid in CHANNEL_ID_FALLBACKS.get(key, ()):
+                if by_channel_id.get(cid):
+                    selected = by_channel_id[cid]
+                    break
+        if not selected and key in required:
+            missing.append("/".join(aliases))
+        series[key] = selected if selected else [(0.0, 0.0)]
+    if missing:
+        raise ValueError(f"missing required channel(s) for overlay: {', '.join(missing)}")
     return series
 
 
-def make_lookup(points):
+def make_lookup(points: Sequence[Tuple[float, float]], default: float = 0.0) -> Callable[[float], float]:
+    if not points:
+        return lambda _t: default
+
     times = [t for t, _ in points]
     vals = [v for _, v in points]
 
@@ -376,9 +484,292 @@ def make_lookup(points):
         idx = bisect.bisect_right(times, t) - 1
         if idx < 0:
             return vals[0]
+        if idx >= len(vals):
+            return vals[-1]
         return vals[idx]
 
     return lookup
+
+
+def ass_dialogue(layer: int, start: float, end: float, style: str, text: str) -> str:
+    return f"Dialogue: {layer},{sec_to_ass(start)},{sec_to_ass(end)},{style},,0,0,0,,{text}"
+
+
+def ass_xy(x: float, y: float) -> str:
+    return f"{int(round(x))} {int(round(y))}"
+
+
+def draw_rect_path(x0: float, y0: float, x1: float, y1: float) -> str:
+    return f"m {ass_xy(x0, y0)} l {ass_xy(x1, y0)} {ass_xy(x1, y1)} {ass_xy(x0, y1)}"
+
+
+def draw_circle_path(cx: float, cy: float, radius: float, segments: int = 48) -> str:
+    points = []
+    for i in range(max(12, segments)):
+        a = (2.0 * math.pi * i) / max(12, segments)
+        points.append((cx + radius * math.cos(a), cy + radius * math.sin(a)))
+    first = points[0]
+    rest = " ".join(ass_xy(x, y) for x, y in points[1:] + [first])
+    return f"m {ass_xy(first[0], first[1])} l {rest}"
+
+
+def draw_thick_line_path(x0: float, y0: float, x1: float, y1: float, thickness: float) -> str:
+    dx = x1 - x0
+    dy = y1 - y0
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        half = thickness / 2.0
+        return draw_rect_path(x0 - half, y0 - half, x0 + half, y0 + half)
+    px = -(dy / length) * (thickness / 2.0)
+    py = (dx / length) * (thickness / 2.0)
+    p1 = (x0 + px, y0 + py)
+    p2 = (x1 + px, y1 + py)
+    p3 = (x1 - px, y1 - py)
+    p4 = (x0 - px, y0 - py)
+    return f"m {ass_xy(*p1)} l {ass_xy(*p2)} {ass_xy(*p3)} {ass_xy(*p4)}"
+
+
+def build_hud_static_lines(total_duration: float, rpm_max_display: float) -> List[str]:
+    lines = []
+    full_start = 0.0
+    full_end = total_duration
+
+    lines.append(
+        ass_dialogue(
+            0,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H2A1A11&\\1a&H88&}}"
+            f"{draw_rect_path(0, HUD_PANEL_TOP, HUD_PLAY_RES_X, HUD_PLAY_RES_Y)}",
+        )
+    )
+
+    lines.append(
+        ass_dialogue(
+            1,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H3C2A1C&\\1a&H48&}}"
+            f"{draw_circle_path(HUD_G_CX, HUD_G_CY, HUD_G_OUTER_R, 56)}",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            1,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H261910&\\1a&H70&}}"
+            f"{draw_circle_path(HUD_G_CX, HUD_G_CY, HUD_G_INNER_R, 56)}",
+        )
+    )
+    for scale in (0.35, 0.65, 1.0):
+        lines.append(
+            ass_dialogue(
+                2,
+                full_start,
+                full_end,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\1a&HFF&\\3c&H9BC8E8&\\3a&H50&\\bord2\\shad0}}"
+                f"{draw_circle_path(HUD_G_CX, HUD_G_CY, HUD_G_INNER_R * scale, 48)}",
+            )
+        )
+    lines.append(
+        ass_dialogue(
+            2,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H8AAECF&\\1a&H70&}}"
+            f"{draw_thick_line_path(HUD_G_CX - HUD_G_INNER_R, HUD_G_CY, HUD_G_CX + HUD_G_INNER_R, HUD_G_CY, 2)}",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            2,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H8AAECF&\\1a&H70&}}"
+            f"{draw_thick_line_path(HUD_G_CX, HUD_G_CY - HUD_G_INNER_R, HUD_G_CX, HUD_G_CY + HUD_G_INNER_R, 2)}",
+        )
+    )
+
+    lines.append(
+        ass_dialogue(
+            1,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H2C1D11&\\1a&H50&}}"
+            f"{draw_rect_path(HUD_RPM_X0, HUD_RPM_Y0, HUD_RPM_X1, HUD_RPM_Y1)}",
+        )
+    )
+    rpm_w = HUD_RPM_X1 - HUD_RPM_X0
+    for start_ratio, end_ratio, color in (
+        (0.0, 0.60, "&H49AF50&"),
+        (0.60, 0.85, "&H35CCEF&"),
+        (0.85, 1.00, "&H4C59FF&"),
+    ):
+        x0 = HUD_RPM_X0 + rpm_w * start_ratio
+        x1 = HUD_RPM_X0 + rpm_w * end_ratio
+        lines.append(
+            ass_dialogue(
+                2,
+                full_start,
+                full_end,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c{color}\\1a&HBB&}}"
+                f"{draw_rect_path(x0, HUD_RPM_Y0, x1, HUD_RPM_Y1)}",
+            )
+        )
+    lines.append(
+        ass_dialogue(
+            2,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\1a&HFF&\\3c&H9BC8E8&\\3a&H22&\\bord3\\shad0}}"
+            f"{draw_rect_path(HUD_RPM_X0, HUD_RPM_Y0, HUD_RPM_X1, HUD_RPM_Y1)}",
+        )
+    )
+
+    for x0, x1 in ((HUD_THROTTLE_X0, HUD_THROTTLE_X1), (HUD_BRAKE_X0, HUD_BRAKE_X1)):
+        lines.append(
+            ass_dialogue(
+                1,
+                full_start,
+                full_end,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H2C1D11&\\1a&H50&}}"
+                f"{draw_rect_path(x0, HUD_PEDAL_Y0, x1, HUD_PEDAL_Y1)}",
+            )
+        )
+        lines.append(
+            ass_dialogue(
+                2,
+                full_start,
+                full_end,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\1a&HFF&\\3c&H9BC8E8&\\3a&H22&\\bord2\\shad0}}"
+                f"{draw_rect_path(x0, HUD_PEDAL_Y0, x1, HUD_PEDAL_Y1)}",
+            )
+        )
+
+    lines.append(
+        ass_dialogue(
+            1,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H3C2A1C&\\1a&H48&}}"
+            f"{draw_circle_path(HUD_STEER_CX, HUD_STEER_CY, HUD_STEER_OUTER_R, 56)}",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            1,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H261910&\\1a&H70&}}"
+            f"{draw_circle_path(HUD_STEER_CX, HUD_STEER_CY, HUD_STEER_INNER_R, 56)}",
+        )
+    )
+    for norm in (-1.0, -0.5, 0.0, 0.5, 1.0):
+        ang = math.radians(-90.0 + (norm * 120.0))
+        x0 = HUD_STEER_CX + math.cos(ang) * (HUD_STEER_INNER_R - 16)
+        y0 = HUD_STEER_CY + math.sin(ang) * (HUD_STEER_INNER_R - 16)
+        x1 = HUD_STEER_CX + math.cos(ang) * (HUD_STEER_INNER_R - 4)
+        y1 = HUD_STEER_CY + math.sin(ang) * (HUD_STEER_INNER_R - 4)
+        lines.append(
+            ass_dialogue(
+                2,
+                full_start,
+                full_end,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H9BC8E8&\\1a&H38&}}"
+                f"{draw_thick_line_path(x0, y0, x1, y1, 3)}",
+            )
+        )
+    lines.append(
+        ass_dialogue(
+            3,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&HAED9FF&\\1a&H24&}}"
+            f"{draw_circle_path(HUD_STEER_CX, HUD_STEER_CY, 7, 18)}",
+        )
+    )
+
+    rpm_mid = (HUD_RPM_X0 + HUD_RPM_X1) // 2
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an2\\pos({rpm_mid},{HUD_RPM_Y0 - 14})\\fs24\\bord1\\shad0}}RPM",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an8\\pos({HUD_RPM_X0},{HUD_RPM_Y1 + 26})\\fs18\\bord1\\shad0}}0",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an8\\pos({HUD_RPM_X1},{HUD_RPM_Y1 + 26})\\fs18\\bord1\\shad0}}{int(round(rpm_max_display))}",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an5\\pos({HUD_G_CX},{HUD_G_CY - HUD_G_OUTER_R - 20})\\fs21\\bord1\\shad0}}G-FORCE",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an5\\pos({(HUD_THROTTLE_X0 + HUD_THROTTLE_X1) // 2},{HUD_PEDAL_Y0 - 18})\\fs18\\bord1\\shad0}}THR",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an5\\pos({(HUD_BRAKE_X0 + HUD_BRAKE_X1) // 2},{HUD_PEDAL_Y0 - 18})\\fs18\\bord1\\shad0}}BRK",
+        )
+    )
+    lines.append(
+        ass_dialogue(
+            4,
+            full_start,
+            full_end,
+            "HudLabel",
+            f"{{\\an5\\pos({HUD_STEER_CX},{HUD_STEER_CY - HUD_STEER_OUTER_R - 20})\\fs21\\bord1\\shad0}}STEER",
+        )
+    )
+    return lines
 
 
 def highlight_time_to_source_time(segments: List[RenderSegment], t_highlight: float) -> float:
@@ -401,50 +792,223 @@ def write_overlay_ass(
 ):
     if not segments:
         raise ValueError("cannot write overlay ass: no segments")
+    if fps <= 0:
+        raise ValueError("overlay fps must be > 0")
 
     series = load_overlay_series(decoded_csv)
     if mapper is not None:
-        remapped = {}
-        for tag, points in series.items():
+        remapped: OverlaySeries = {}
+        for key, points in series.items():
             remapped_points = [(mapper.telemetry_to_media(t), v) for t, v in points]
             remapped_points.sort(key=lambda x: x[0])
-            remapped[tag] = remapped_points
+            remapped[key] = remapped_points
         series = remapped
-    rpm_lookup = make_lookup(series[RPM_TAG])
-    lat_lookup = make_lookup(series[LAT_TAG])
-    lon_lookup = make_lookup(series[LON_TAG])
+    rpm_lookup = make_lookup(series["rpm"])
+    lat_lookup = make_lookup(series["lat"])
+    lon_lookup = make_lookup(series["lon"])
+    throttle_lookup = make_lookup(series["throttle"])
+    brake_lookup = make_lookup(series["brake"])
+    steering_lookup = make_lookup(series["steering"])
 
     total_duration = sum(s.duration for s in segments)
     frame_dt = 1.0 / fps
+    rpm_samples = [max(0.0, v * 60.0 / (2.0 * math.pi)) for _, v in series["rpm"]]
+    rpm_max_display = percentile(rpm_samples, 0.995)
+    rpm_max_display = clamp(rpm_max_display, 5000.0, 12000.0)
+    rpm_max_display = math.ceil(rpm_max_display / 250.0) * 250.0
 
-    lines = []
+    lines = build_hud_static_lines(total_duration, rpm_max_display)
+    smoothed: Optional[Dict[str, float]] = None
+    rpm_rise_alpha = 0.65
+    rpm_fall_alpha = 0.95
+    control_smooth_alpha = 0.35
+    rpm_text_y = min(HUD_PLAY_RES_Y - 26, HUD_RPM_Y1 + 34)
+    g_text_y = min(HUD_PLAY_RES_Y - 26, HUD_G_CY + HUD_G_OUTER_R - 8)
+    steer_text_y = min(HUD_PLAY_RES_Y - 26, HUD_STEER_CY + HUD_STEER_OUTER_R - 8)
+    pedal_text_y = min(HUD_PLAY_RES_Y - 26, HUD_PEDAL_Y1 + 24)
     t = 0.0
     while t < total_duration:
         t2 = min(t + frame_dt, total_duration)
         src_t = highlight_time_to_source_time(segments, t)
-        rpm_rad_s = rpm_lookup(src_t)
-        rpm = rpm_rad_s * 60.0 / (2.0 * math.pi)
-        lat_g = lat_lookup(src_t) / 9.80665
-        lon_g = lon_lookup(src_t) / 9.80665
-        text = f"RPM: {rpm:6.0f} | Lat G: {lat_g:+.2f} | Long G: {lon_g:+.2f}"
+
+        raw = {
+            "rpm": max(0.0, rpm_lookup(src_t) * 60.0 / (2.0 * math.pi)),
+            "lat": lat_lookup(src_t) / 9.80665,
+            "lon": lon_lookup(src_t) / 9.80665,
+            "throttle": clamp(throttle_lookup(src_t), 0.0, 1.0),
+            "brake": clamp(brake_lookup(src_t), 0.0, 1.0),
+            "steer_deg": steering_lookup(src_t) * 180.0 / math.pi,
+        }
+        if smoothed is None:
+            smoothed = dict(raw)
+        else:
+            rpm_alpha = rpm_rise_alpha if raw["rpm"] >= smoothed["rpm"] else rpm_fall_alpha
+            smoothed["rpm"] += rpm_alpha * (raw["rpm"] - smoothed["rpm"])
+            smoothed["lat"] += control_smooth_alpha * (raw["lat"] - smoothed["lat"])
+            smoothed["lon"] += control_smooth_alpha * (raw["lon"] - smoothed["lon"])
+            smoothed["throttle"] += control_smooth_alpha * (raw["throttle"] - smoothed["throttle"])
+            smoothed["brake"] += control_smooth_alpha * (raw["brake"] - smoothed["brake"])
+            smoothed["steer_deg"] += control_smooth_alpha * (raw["steer_deg"] - smoothed["steer_deg"])
+
+        rpm = max(0.0, smoothed["rpm"])
+        rpm_ratio = clamp(rpm / max(1.0, rpm_max_display), 0.0, 1.0)
+        lat_g = clamp(smoothed["lat"], -4.0, 4.0)
+        lon_g = clamp(smoothed["lon"], -4.0, 4.0)
+        throttle = clamp(smoothed["throttle"], 0.0, 1.0)
+        brake = clamp(smoothed["brake"], 0.0, 1.0)
+        steer_deg = clamp(smoothed["steer_deg"], -HUD_STEER_MAX_DEG, HUD_STEER_MAX_DEG)
+
+        rpm_fill_x = HUD_RPM_X0 + int(round((HUD_RPM_X1 - HUD_RPM_X0) * rpm_ratio))
+        if rpm_fill_x > HUD_RPM_X0:
+            fill_color = "&H49D36A&"
+            if rpm_ratio >= 0.85:
+                fill_color = "&H4F65FF&"
+            elif rpm_ratio >= 0.60:
+                fill_color = "&H3DDCF6&"
+            lines.append(
+                ass_dialogue(
+                    5,
+                    t,
+                    t2,
+                    "HudLabel",
+                    f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c{fill_color}\\1a&H28&}}"
+                    f"{draw_rect_path(HUD_RPM_X0, HUD_RPM_Y0, rpm_fill_x, HUD_RPM_Y1)}",
+                )
+            )
+            lines.append(
+                ass_dialogue(
+                    6,
+                    t,
+                    t2,
+                    "HudLabel",
+                    f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&HD9EEFF&\\1a&H20&}}"
+                    f"{draw_rect_path(rpm_fill_x - 2, HUD_RPM_Y0 - 8, rpm_fill_x + 2, HUD_RPM_Y1 + 8)}",
+                )
+            )
+
+        g_x = HUD_G_CX + clamp(lat_g / HUD_G_RANGE, -1.0, 1.0) * HUD_G_INNER_R
+        g_y = HUD_G_CY - clamp(lon_g / HUD_G_RANGE, -1.0, 1.0) * HUD_G_INNER_R
         lines.append(
-            "Dialogue: 0,"
-            f"{sec_to_ass(t)},"
-            f"{sec_to_ass(t2)},"
-            "Telemetry,,0,0,0,,"
-            f"{text}"
+            ass_dialogue(
+                6,
+                t,
+                t2,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H6AA0CF&\\1a&H48&}}"
+                f"{draw_circle_path(g_x, g_y, HUD_G_DOT_R + 4, 20)}",
+            )
+        )
+        lines.append(
+            ass_dialogue(
+                7,
+                t,
+                t2,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H95CAFF&\\1a&H14&}}"
+                f"{draw_circle_path(g_x, g_y, HUD_G_DOT_R, 20)}",
+            )
+        )
+
+        pedal_h = HUD_PEDAL_Y1 - HUD_PEDAL_Y0
+        if throttle > 0.001:
+            thr_top = HUD_PEDAL_Y1 - (pedal_h * throttle)
+            lines.append(
+                ass_dialogue(
+                    5,
+                    t,
+                    t2,
+                    "HudLabel",
+                    f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H4ACF59&\\1a&H24&}}"
+                    f"{draw_rect_path(HUD_THROTTLE_X0, thr_top, HUD_THROTTLE_X1, HUD_PEDAL_Y1)}",
+                )
+            )
+        if brake > 0.001:
+            brk_top = HUD_PEDAL_Y1 - (pedal_h * brake)
+            lines.append(
+                ass_dialogue(
+                    5,
+                    t,
+                    t2,
+                    "HudLabel",
+                    f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H5166FF&\\1a&H24&}}"
+                    f"{draw_rect_path(HUD_BRAKE_X0, brk_top, HUD_BRAKE_X1, HUD_PEDAL_Y1)}",
+                )
+            )
+
+        steer_norm = steer_deg / HUD_STEER_MAX_DEG
+        steer_ang = math.radians(-90.0 + (steer_norm * 120.0))
+        steer_tip_x = HUD_STEER_CX + math.cos(steer_ang) * (HUD_STEER_INNER_R - 12)
+        steer_tip_y = HUD_STEER_CY + math.sin(steer_ang) * (HUD_STEER_INNER_R - 12)
+        lines.append(
+            ass_dialogue(
+                6,
+                t,
+                t2,
+                "HudLabel",
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H9FD6FF&\\1a&H18&}}"
+                f"{draw_thick_line_path(HUD_STEER_CX, HUD_STEER_CY, steer_tip_x, steer_tip_y, 8)}",
+            )
+        )
+
+        g_total = math.hypot(lat_g, lon_g)
+        lines.append(
+            ass_dialogue(
+                8,
+                t,
+                t2,
+                "HudMono",
+                f"{{\\an5\\pos({(HUD_RPM_X0 + HUD_RPM_X1) // 2},{rpm_text_y})\\fs28\\bord2\\shad0}}{rpm:5.0f} rpm",
+            )
+        )
+        lines.append(
+            ass_dialogue(
+                8,
+                t,
+                t2,
+                "HudMono",
+                f"{{\\an5\\pos({HUD_G_CX},{g_text_y})\\fs20\\bord1\\shad0}}"
+                f"{lat_g:+.2f} lat  {lon_g:+.2f} lon  |g| {g_total:.2f}",
+            )
+        )
+        lines.append(
+            ass_dialogue(
+                8,
+                t,
+                t2,
+                "HudMono",
+                f"{{\\an5\\pos({HUD_STEER_CX},{steer_text_y})\\fs24\\bord1\\shad0}}{steer_deg:+.0f} deg",
+            )
+        )
+        lines.append(
+            ass_dialogue(
+                8,
+                t,
+                t2,
+                "HudMono",
+                f"{{\\an5\\pos({(HUD_THROTTLE_X0 + HUD_THROTTLE_X1) // 2},{pedal_text_y})\\fs18\\bord1\\shad0}}{int(round(throttle * 100)):3d}%",
+            )
+        )
+        lines.append(
+            ass_dialogue(
+                8,
+                t,
+                t2,
+                "HudMono",
+                f"{{\\an5\\pos({(HUD_BRAKE_X0 + HUD_BRAKE_X1) // 2},{pedal_text_y})\\fs18\\bord1\\shad0}}{int(round(brake * 100)):3d}%",
+            )
         )
         t = t2
 
-    header = """[Script Info]
+    header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
+PlayResX: {HUD_PLAY_RES_X}
+PlayResY: {HUD_PLAY_RES_Y}
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Telemetry,Menlo,38,&H00FFFFFF,&H000000FF,&H00101010,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,36,1
+Style: HudLabel,Arial,24,&H00D6E6F5,&H00000000,&H00201008,&H70000000,0,0,0,0,100,100,0,0,1,2,0,7,20,20,20,1
+Style: HudMono,Menlo,24,&H00F0F8FF,&H00000000,&H00201008,&H70000000,0,0,0,0,100,100,0,0,1,2,0,7,20,20,20,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -542,8 +1106,8 @@ def main():
     ap.add_argument("--min-segment-seconds", type=int, default=20)
     ap.add_argument("--merge-gap-seconds", type=int, default=4)
     ap.add_argument("--max-total-seconds", type=int, default=120)
-    ap.add_argument("--overlay-fps", type=float, default=29.97)
-    ap.add_argument("--no-overlay", action="store_true", help="Disable telemetry text overlay")
+    ap.add_argument("--overlay-fps", type=float, default=29.97, help="Sampling rate for telemetry HUD overlay")
+    ap.add_argument("--no-overlay", action="store_true", help="Disable telemetry HUD overlay")
     ap.add_argument("--run", action="store_true", help="Render output video from plan")
     args = ap.parse_args()
 
