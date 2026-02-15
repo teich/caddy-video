@@ -2,10 +2,10 @@
 
 Telemetry-driven highlight generation for GM/Cosworth AliveDrive (`adco`) videos.
 
-This repo currently does three things:
-1. Extract and decode embedded telemetry from an MP4.
-2. Plan highlight segments from telemetry signal intensity.
-3. Render one final highlights MP4 with telemetry text overlay (`RPM`, `Lat G`, `Long G`).
+This repo currently supports a one-command workflow:
+1. Take one or more raw MP4s from your PDR/SD card.
+2. Extract and decode telemetry automatically.
+3. Produce one final highlights MP4 per input, with telemetry text overlay (`RPM`, `Lat G`, `Long G`).
 
 ## Requirements
 
@@ -30,46 +30,43 @@ You should see a `subtitles` filter line.
 - `input/`: local source videos (ignored by git).
 - `output/`: generated data/videos (ignored by git).
 
-## Quick start
+## Quick start (recommended)
 
 Use an input file such as `input/ADV_0071.mp4`.
 
-### 1. Decode telemetry
+Process one file:
 
 ```bash
-python3 extract_alive.py input/ADV_0071.mp4 --out-dir output
+python3 process_pdr.py input/ADV_0071.mp4
 ```
 
-Generates (among others):
-- `output/ADV_0071.decoded_updates.csv`
-- `output/ADV_0071.channels.csv`
-
-### 2. Build a highlight plan (no render)
+Process multiple files:
 
 ```bash
-python3 make_highlights.py \
-  --video input/ADV_0071.mp4 \
-  --decoded output/ADV_0071.decoded_updates.csv \
-  --out-dir output
+python3 process_pdr.py input/*.mp4
 ```
 
-This writes:
-- `output/ADV_0071.highlights.csv` (planned segments)
-- `output/ADV_0071.highlights.ffmpeg.txt` (render command preview)
-- `output/ADV_0071.highlights.overlay.ass` (overlay subtitles for planned cut)
+Final outputs are written to:
+- `output/final/<input_stem>.highlights.mp4`
 
-### 3. Render final highlight video (single pass)
+Useful options:
 
 ```bash
-python3 make_highlights.py \
-  --video input/ADV_0071.mp4 \
-  --decoded output/ADV_0071.decoded_updates.csv \
-  --out-dir output \
-  --run
+python3 process_pdr.py input/*.mp4 \
+  --out-dir output/final \
+  --target-seconds 90 \
+  --max-total-seconds 120 \
+  --keep-work
 ```
 
-Final output:
-- `output/ADV_0071.highlights.mp4`
+`--keep-work` preserves per-file intermediates for debugging.
+
+## Advanced tools
+
+If you want direct control/debugging, these scripts are still available:
+- `extract_alive.py`: decode telemetry only
+- `make_highlights.py`: plan/render highlights from an existing decoded CSV
+- `render_text_overlay.py`: render full-session text overlay (debug helper)
 
 ## Tuning highlight behavior
 

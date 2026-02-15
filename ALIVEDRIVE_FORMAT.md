@@ -1,10 +1,6 @@
 # AliveDrive Telemetry Format Specification
 
-Reverse-engineered from the Cosworth AliveDrive Apex application (v3.3.1), used in
-GM Performance Data Recorder (PDR) systems (Corvette, Camaro, CT4-V/CT5-V Blackwing, etc.).
-
-**Format Version:** 5 (referred to as "v5" in the codebase)
-**Producer:** Cosworth Electronics Ltd
+Version 2.5 Used in GM Performance Data Recorder (PDR) systems (2026 Corvette, 2025+ CT5-V Blackwing).
 
 ---
 
